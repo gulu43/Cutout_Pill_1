@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Cutout Pill</string>
+    <string name="service_desc">Taps over the camera cutout to open the brightness pill.</string>
+</resources>

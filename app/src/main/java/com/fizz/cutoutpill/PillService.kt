@@ -2,6 +2,7 @@ package com.fizz.cutoutpill
 
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
+import android.animation.TimeInterpolator
 import android.animation.ValueAnimator
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -31,14 +32,21 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
-import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import androidx.core.app.NotificationCompat
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class PillService : Service() {
+
+    companion object {
+        private const val PILL_CORNER_DP = 28   // final corner radius of the open pill
+        private const val PILL_ALPHA = 242      // 0-255, pill opacity (242 = ~95%)
+        private const val OPEN_MS = 380L
+        private const val CLOSE_MS = 280L
+    }
 
     private lateinit var wm: WindowManager
     private lateinit var prefs: SharedPreferences
@@ -49,14 +57,10 @@ class PillService : Service() {
     private var pillRootView: FrameLayout? = null
     private var pillContainer: FrameLayout? = null
     private var pillContent: View? = null
-    private var windowBgDrawable: GradientDrawable? = null
-    
+
     private var isPillVisible = false
-    private var isOpening = false
-    private var shapeFraction = 0f
-    private var crossfadeFraction = 0f
+    private var shapeFraction = 0f      // 0 = a 1px dot at the tap-area centre, 1 = full pill
     private var currentAnimator: ValueAnimator? = null
-    private var needsRebuildOnClose = false
 
     private val localCutout = RectF()
     private val localPill = RectF()
@@ -81,7 +85,7 @@ class PillService : Service() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 Intent.ACTION_SCREEN_OFF -> {
-                    hidePill(animate = false)
+                    closePillImmediately()
                     removeView(hotspot); hotspot = null
                     removeView(preview); preview = null
                 }
@@ -138,17 +142,14 @@ class PillService : Service() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         refreshOverlays()
-        if (!isPillVisible) {
-            removePillWindow()
-        } else {
-            needsRebuildOnClose = true
-        }
+        if (!isPillVisible) removePillWindow()
     }
 
     override fun onDestroy() {
         unregisterReceiver(screenReceiver)
         if (::prefs.isInitialized) prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
-        hidePill(animate = false)
+        closePillImmediately()
+        handler.removeCallbacksAndMessages(null)
         removeView(hotspot); hotspot = null
         removeView(preview); preview = null
         super.onDestroy()
@@ -212,53 +213,10 @@ class PillService : Service() {
 
     private fun lerp(start: Float, stop: Float, fraction: Float) = start + (stop - start) * fraction
 
-    private fun lerpColor(colorStart: Int, colorEnd: Int, fraction: Float): Int {
-        return Color.argb(
-            (Color.alpha(colorStart) + (Color.alpha(colorEnd) - Color.alpha(colorStart)) * fraction).toInt(),
-            (Color.red(colorStart) + (Color.red(colorEnd) - Color.red(colorStart)) * fraction).toInt(),
-            (Color.green(colorStart) + (Color.green(colorEnd) - Color.green(colorStart)) * fraction).toInt(),
-            (Color.blue(colorStart) + (Color.blue(colorEnd) - Color.blue(colorStart)) * fraction).toInt()
-        )
-    }
-
     private fun updatePillVisuals() {
-        val container = pillContainer ?: return
-        val root = pillRootView ?: return
-
-        container.invalidateOutline()
-        pillContent?.alpha = ((shapeFraction - 0.5f) * 2f).coerceIn(0f, 1f)
-
-        val blurSupported = android.os.Build.VERSION.SDK_INT >= 31 && wm.isCrossWindowBlurEnabled
-        val bgAlpha = if (blurSupported) 200 else 242
-        val baseColor = PillColors.of(this).background
-        val targetColor = Color.argb(bgAlpha, Color.red(baseColor), Color.green(baseColor), Color.blue(baseColor))
-
-        val colorFraction = (shapeFraction / 0.3f).coerceIn(0f, 1f)
-        val viewBaseColor = lerpColor(Color.BLACK, targetColor, colorFraction)
-
-        val viewAlphaMultiplier = 1f - crossfadeFraction
-        val viewFinalColor = Color.argb(
-            (Color.alpha(viewBaseColor) * viewAlphaMultiplier).toInt(),
-            Color.red(viewBaseColor),
-            Color.green(viewBaseColor),
-            Color.blue(viewBaseColor)
-        )
-        (container.background as? ColorDrawable)?.color = viewFinalColor
-
-        windowBgDrawable?.setColor(targetColor)
-        windowBgDrawable?.alpha = (crossfadeFraction * 255).toInt()
-
-        // Efficiently update Window LayoutParams only when blur radius changes
-        if (blurSupported) {
-            val lp = root.layoutParams as? WindowManager.LayoutParams
-            if (lp != null) {
-                val newRadius = (crossfadeFraction * 24).toInt()
-                if (lp.blurBehindRadius != newRadius) {
-                    lp.blurBehindRadius = newRadius
-                    if (root.isAttachedToWindow) wm.updateViewLayout(root, lp)
-                }
-            }
-        }
+        pillContainer?.invalidateOutline()
+        // content fades in late on open and out early on close
+        pillContent?.alpha = ((shapeFraction - 0.45f) / 0.55f).coerceIn(0f, 1f)
     }
 
     private fun getPillWindow(pillW: Int, pillH: Int, margin: Int, top: Int): FrameLayout {
@@ -271,48 +229,41 @@ class PillService : Service() {
                 }
             }
             val lp = overlayParams(pillW, pillH, margin, top, touchable = true, watchOutside = true)
-            
-            val blurSupported = android.os.Build.VERSION.SDK_INT >= 31 && wm.isCrossWindowBlurEnabled
-            if (blurSupported) {
-                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-                lp.blurBehindRadius = 0
-            }
-            
-            windowBgDrawable = GradientDrawable().apply {
-                cornerRadius = dp(28).toFloat()
-                alpha = 0
-            }
-            root.background = windowBgDrawable
 
             val content = buildPill()
             pillContent = content
+
+            // ONE solid layer in the theme colour (white in light theme, black in dark).
+            // The shape comes only from the outline below, so there is no second layer
+            // to crossfade and nothing see-through or differently rounded.
+            val base = PillColors.of(this).background
             val fl = FrameLayout(this)
             fl.clipToOutline = true
-            fl.background = ColorDrawable(Color.BLACK)
+            fl.background = ColorDrawable(
+                Color.argb(PILL_ALPHA, Color.red(base), Color.green(base), Color.blue(base))
+            )
             fl.addView(content, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
-            
+
+            val maxRadius = dp(PILL_CORNER_DP).toFloat()
             fl.outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
-                    val currentRect = RectF(
-                        lerp(localCutout.left, localPill.left, shapeFraction),
-                        lerp(localCutout.top, localPill.top, shapeFraction),
-                        lerp(localCutout.right, localPill.right, shapeFraction),
-                        lerp(localCutout.bottom, localPill.bottom, shapeFraction)
-                    )
-                    val radius = min(currentRect.width(), currentRect.height()) / 2f
-                    outline.setRoundRect(
-                        currentRect.left.toInt(), currentRect.top.toInt(),
-                        currentRect.right.toInt(), currentRect.bottom.toInt(), radius
-                    )
+                    val l = lerp(localCutout.left, localPill.left, shapeFraction).roundToInt()
+                    val t = lerp(localCutout.top, localPill.top, shapeFraction).roundToInt()
+                    var r = lerp(localCutout.right, localPill.right, shapeFraction).roundToInt()
+                    var b = lerp(localCutout.bottom, localPill.bottom, shapeFraction).roundToInt()
+                    if (r <= l) r = l + 1          // never an empty outline
+                    if (b <= t) b = t + 1
+                    // fully round while small, then settles at PILL_CORNER_DP with no jump
+                    val radius = min(min((r - l), (b - t)) / 2f, maxRadius)
+                    outline.setRoundRect(l, t, r, b, radius)
                 }
             }
 
             root.addView(fl, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             pillContainer = fl
             pillRootView = root
-            
+
             shapeFraction = 0f
-            crossfadeFraction = 0f
             updatePillVisuals()
             wm.addView(root, lp)
         }
@@ -320,94 +271,41 @@ class PillService : Service() {
     }
 
     private fun removePillWindow() {
-        pillRootView?.let { 
-            runCatching { wm.removeView(it) } 
+        pillRootView?.let {
+            runCatching { wm.removeView(it) }
             pillRootView = null
         }
         pillContainer = null
         pillContent = null
-        windowBgDrawable = null
     }
 
-    private fun startNextOpenPhase() {
-        if (shapeFraction < 1f) {
-            val duration = ((1f - shapeFraction) * 350).toLong()
-            currentAnimator = ValueAnimator.ofFloat(shapeFraction, 1f).apply {
-                this.duration = duration
-                interpolator = OvershootInterpolator(0.9f)
-                addUpdateListener {
-                    shapeFraction = it.animatedValue as Float
-                    updatePillVisuals()
-                }
-                addListener(object : AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: Animator) {
-                        if (isOpening) startNextOpenPhase()
-                    }
-                })
-                start()
-            }
-        } else if (crossfadeFraction < 1f) {
-            val duration = ((1f - crossfadeFraction) * 120).toLong()
-            currentAnimator = ValueAnimator.ofFloat(crossfadeFraction, 1f).apply {
-                this.duration = duration
-                interpolator = LinearInterpolator()
-                addUpdateListener {
-                    crossfadeFraction = it.animatedValue as Float
-                    updatePillVisuals()
-                }
-                addListener(object : AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: Animator) {
-                        pillContainer?.setLayerType(View.LAYER_TYPE_NONE, null)
-                    }
-                })
-                start()
-            }
-        } else {
-            pillContainer?.setLayerType(View.LAYER_TYPE_NONE, null)
-        }
+    private fun stopAnimator() {
+        // remove listeners first so cancel() can't trigger the end callback
+        currentAnimator?.apply { removeAllListeners(); cancel() }
+        currentAnimator = null
     }
 
-    private fun startNextClosePhase() {
-        if (crossfadeFraction > 0f) {
-            val duration = (crossfadeFraction * 120).toLong()
-            currentAnimator = ValueAnimator.ofFloat(crossfadeFraction, 0f).apply {
-                this.duration = duration
-                interpolator = LinearInterpolator()
-                addUpdateListener {
-                    crossfadeFraction = it.animatedValue as Float
-                    updatePillVisuals()
-                }
-                addListener(object : AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: Animator) {
-                        if (!isOpening) startNextClosePhase()
-                    }
-                })
-                start()
+    private fun animateShape(
+        to: Float, durationMs: Long, interp: TimeInterpolator, onEnd: (() -> Unit)? = null
+    ) {
+        stopAnimator()
+        pillContainer?.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        currentAnimator = ValueAnimator.ofFloat(shapeFraction, to).apply {
+            duration = durationMs
+            interpolator = interp
+            addUpdateListener {
+                shapeFraction = it.animatedValue as Float
+                updatePillVisuals()
             }
-        } else if (shapeFraction > 0f) {
-            val duration = (shapeFraction * 300).toLong()
-            currentAnimator = ValueAnimator.ofFloat(shapeFraction, 0f).apply {
-                this.duration = duration
-                interpolator = DecelerateInterpolator()
-                addUpdateListener {
-                    shapeFraction = it.animatedValue as Float
-                    updatePillVisuals()
+            addListener(object : AnimatorListenerAdapter() {
+                private var cancelled = false
+                override fun onAnimationCancel(animation: Animator) { cancelled = true }
+                override fun onAnimationEnd(animation: Animator) {
+                    pillContainer?.setLayerType(View.LAYER_TYPE_NONE, null)
+                    if (!cancelled) onEnd?.invoke()
                 }
-                addListener(object : AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: Animator) {
-                        if (!isOpening) {
-                            pillContainer?.setLayerType(View.LAYER_TYPE_NONE, null)
-                            removePillWindow()
-                            if (needsRebuildOnClose) needsRebuildOnClose = false
-                        }
-                    }
-                })
-                start()
-            }
-        } else {
-            pillContainer?.setLayerType(View.LAYER_TYPE_NONE, null)
-            removePillWindow()
-            if (needsRebuildOnClose) needsRebuildOnClose = false
+            })
+            start()
         }
     }
 
@@ -422,38 +320,38 @@ class PillService : Service() {
         val top = dp(14)
         val pillW = screenW - margin * 2
         val pillH = dp(116)
-        
-        getPillWindow(pillW, pillH, margin, top)
 
-        localCutout.set(
-            (r.left - margin).toFloat(), (r.top - top).toFloat(),
-            (r.right - margin).toFloat(), (r.bottom - top).toFloat()
-        )
+        // The pill grows out of (and shrinks back into) a 1px dot at the centre of the tap area
+        val cx = (r.centerX() - margin).toFloat()
+        val cy = (r.centerY() - top).toFloat()
+        localCutout.set(cx - 0.5f, cy - 0.5f, cx + 0.5f, cy + 0.5f)
         localPill.set(0f, 0f, pillW.toFloat(), pillH.toFloat())
 
-        currentAnimator?.cancel()
-        pillContainer?.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-        isOpening = true
-        startNextOpenPhase()
+        getPillWindow(pillW, pillH, margin, top)
+
+        val remaining = (1f - shapeFraction).coerceIn(0f, 1f)
+        val d = (OPEN_MS * remaining).toLong().coerceAtLeast(120L)
+        animateShape(1f, d, OvershootInterpolator(0.9f))
     }
 
     private fun hidePill(animate: Boolean = true) {
+        if (!animate) { closePillImmediately(); return }
         handler.removeCallbacks(autoHide)
         if (!isPillVisible) return
         isPillVisible = false
-        currentAnimator?.cancel()
-        
-        if (!animate) {
-            shapeFraction = 0f
-            crossfadeFraction = 0f
-            removePillWindow()
-            needsRebuildOnClose = false
-            return
+
+        val d = (CLOSE_MS * shapeFraction.coerceIn(0f, 1f)).toLong().coerceAtLeast(120L)
+        animateShape(0f, d, DecelerateInterpolator()) {
+            if (!isPillVisible) removePillWindow()
         }
-        
-        pillContainer?.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-        isOpening = false
-        startNextClosePhase()
+    }
+
+    private fun closePillImmediately() {
+        handler.removeCallbacks(autoHide)
+        stopAnimator()
+        isPillVisible = false
+        shapeFraction = 0f
+        removePillWindow()
     }
 
     private fun resetTimer() {
